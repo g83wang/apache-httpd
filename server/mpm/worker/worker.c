@@ -103,14 +103,14 @@
  * the overhead.
  */
 #ifndef DEFAULT_THREAD_LIMIT
-#define DEFAULT_THREAD_LIMIT 64
+#define DEFAULT_THREAD_LIMIT 20000
 #endif
 
 /* Admin can't tune ThreadLimit beyond MAX_THREAD_LIMIT.  We want
  * some sort of compile-time limit to help catch typos.
  */
 #ifndef MAX_THREAD_LIMIT
-#define MAX_THREAD_LIMIT 20000
+#define MAX_THREAD_LIMIT 20001
 #endif
 
 /*
@@ -137,6 +137,12 @@ static fd_queue_t *worker_queue;
 static fd_queue_info_t *worker_queue_info;
 static apr_pollset_t *worker_pollset;
 
+/* For generating threads on demand */
+struct apr_thread_cond_t * empty_cond;
+struct apr_thread_cond_t * full_cond;
+struct apr_thread_mutex_t * worker_mutex;
+int num_idler = 0;
+/************************************/
 
 /* data retained by worker across load/unload of the module
  * allocated on first call to pre-config hook; located on
@@ -566,6 +572,9 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t *thd, void * dummy)
         }
         if (listener_may_exit) break;
 
+	apr_thread_mutex_lock(worker_mutex);
+        while(num_idler == 0) apr_thread_cond_wait(full_cond, worker_mutex);
+
         if (!have_idle_worker) {
             rv = ap_queue_info_wait_for_idler(worker_queue_info, NULL);
             if (APR_STATUS_IS_EOF(rv)) {
@@ -710,6 +719,9 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t *thd, void * dummy)
             }
             break;
         }
+	num_idler--;
+        apr_thread_cond_signal(empty_cond);
+        apr_thread_mutex_unlock(worker_mutex);
     }
 
     ap_close_listeners_ex(my_bucket->listeners);
@@ -949,7 +961,11 @@ static void * APR_THREAD_FUNC start_threads(apr_thread_t *thd, void *dummy)
     while (1) {
         /* threads_per_child does not include the listener thread */
         for (i = 0; i < threads_per_child; i++) {
-            int status = ap_scoreboard_image->servers[my_child_num][i].status;
+            
+	    apr_thread_mutex_lock(worker_mutex);
+	    while(num_idler == 1) apr_thread_cond_wait(empty_cond, worker_mutex);
+
+	    int status = ap_scoreboard_image->servers[my_child_num][i].status;
 
             if (status != SERVER_GRACEFUL && status != SERVER_DEAD) {
                 continue;
@@ -974,13 +990,11 @@ static void * APR_THREAD_FUNC start_threads(apr_thread_t *thd, void *dummy)
                 /* let the parent decide how bad this really is */
                 clean_child_exit(APEXIT_CHILDSICK);
             }
-            threads_created++;
+	    num_idler++;
+            apr_thread_cond_signal(full_cond);
+            apr_thread_mutex_unlock(worker_mutex);
         }
-        /* Start the listener only when there are workers available */
-        if (!listener_started && threads_created) {
-            create_listener_thread(ts);
-            listener_started = 1;
-        }
+	continue;
         if (start_thread_may_exit || threads_created == threads_per_child) {
             break;
         }
@@ -1192,6 +1206,12 @@ static void child_main(int child_num_arg, int child_bucket)
     ts->listener = NULL;
     ts->child_num_arg = child_num_arg;
     ts->threadattr = thread_attr;
+
+    apr_thread_mutex_create(&worker_mutex, APR_THREAD_MUTEX_DEFAULT, pruntime);
+    apr_thread_cond_create(&empty_cond, pruntime);
+    apr_thread_cond_create(&full_cond, pruntime);
+
+    create_listener_thread(ts);
 
     rv = apr_thread_create(&start_thread_id, thread_attr, start_threads,
                            ts, pchild);
